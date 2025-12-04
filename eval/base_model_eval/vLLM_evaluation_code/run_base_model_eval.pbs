@@ -1,0 +1,191 @@
+#!/bin/bash
+#PBS -q ic102
+#PBS -P 71001002
+#PBS -j oe
+#PBS -k oed
+#PBS -l select=1:ngpus=1:ncpus=12:mem=150gb
+#PBS -l walltime=72:00:00
+
+# When running locally (not via qsub), set PBS_O_WORKDIR to current directory
+if [ -z "$PBS_O_WORKDIR" ]; then
+    PBS_O_WORKDIR=$(dirname "$(readlink -f "$0")")
+    cd "$PBS_O_WORKDIR"
+else
+    cd $PBS_O_WORKDIR
+fi
+
+# Load CUDA module
+module load cuda/12.6.0
+
+if [ "$POLICY_MODEL_PATH" == "OpenGVLab/InternVL2_5-8B" ]; then
+    # Requires TRANSFORMERS_VERSION=4.37.2 # TODO: right now uses same env but should use another env
+    source /data/projects/71001002/ob1/vlprm/.venv/bin/activate
+else
+    source /data/projects/71001002/ob1/vlprm/eval/.venv/bin/activate
+fi
+
+echo "Python path after activation: $(which python)"
+echo "Python version: $(python --version)"
+
+# Environment setup
+export CUDA_VISIBLE_DEVICES=0
+export HF_HOME=/home/users/nus/ob1/scratch/.cache/huggingface # TODO: Change accordingly
+export PYTHONUNBUFFERED=1
+
+# Quick CUDA driver initialization check
+echo "Running CUDA driver initialization check..."
+
+# Quick nvidia-smi test (< 1 second)
+nvidia-smi --query-gpu=name --format=csv,noheader > /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    echo "ERROR: nvidia-smi failed - NVIDIA driver not responding"
+    echo "Job will exit with error code 99 to signal requeue needed."
+    exit 99
+fi
+
+# Test CUDA availability on the GPU
+python -c "
+import sys
+import torch
+
+for gpu_id in range(1):
+    try:
+        if torch.cuda.is_available():
+            capability = torch.cuda.get_device_capability(gpu_id)
+            print(f'GPU {gpu_id}: CUDA initialized successfully (capability: {capability})')
+        else:
+            print(f'ERROR: CUDA not available for GPU {gpu_id}')
+            sys.exit(1)
+    except RuntimeError as e:
+        if 'CUDA driver initialization failed' in str(e):
+            print(f'ERROR: CUDA driver initialization failed for GPU {gpu_id}!')
+            sys.exit(2)
+        else:
+            print(f'ERROR on GPU {gpu_id}: {e}')
+            sys.exit(3)
+    except Exception as e:
+        print(f'ERROR: Unexpected error on GPU {gpu_id}: {e}')
+        sys.exit(4)
+"
+
+if [ $? -ne 0 ]; then
+    echo "ERROR: CUDA driver initialization check failed!"
+    echo "The node GPU drivers are not properly initialized."
+    echo "Job will exit with error code 99 to signal requeue needed."
+    exit 99
+fi
+
+echo "✓ CUDA driver initialization check passed for GPU"
+
+# Add the parent directory to PYTHONPATH so imports work correctly
+export PYTHONPATH="${PYTHONPATH}:/data/projects/71001002/ob1/vlprm/"
+
+# Get model path from environment variable (passed via qsub -v)
+if [ -z "$POLICY_MODEL_PATH" ]; then
+    echo "Error: POLICY_MODEL_PATH not set. This script should be submitted via launch_base_model_evals.sh"
+    exit 1
+fi
+
+# Get dataset from environment variable (passed via qsub -v)
+if [ -z "$DATASET" ]; then
+    echo "Error: DATASET not set. This script should be submitted via launch_base_model_evals.sh"
+    exit 1
+fi
+
+# Log file coordination - EVAL_RUN_LOG_FILE is set by launcher script
+if [ -n "$EVAL_RUN_LOG_FILE" ]; then
+    echo "Using coordinated log file: $EVAL_RUN_LOG_FILE"
+fi
+
+# Extract model prefix for output directory organization
+if [[ $POLICY_MODEL_PATH =~ [Qq]wen.*32B ]]; then
+    MODEL_PREFIX="Q32B"
+elif [[ $POLICY_MODEL_PATH =~ [Qq]wen.*7B ]]; then
+    MODEL_PREFIX="Q7B"
+elif [[ $POLICY_MODEL_PATH =~ [Gg]emma.*27b ]]; then
+    MODEL_PREFIX="G27B"
+elif [[ $POLICY_MODEL_PATH =~ [Gg]emma.*12b ]]; then
+    MODEL_PREFIX="G12B"
+elif [[ $POLICY_MODEL_PATH =~ [Ii]nternVL2_5-8B ]]; then
+    MODEL_PREFIX="I8B"
+elif [[ $POLICY_MODEL_PATH =~ [Mm]iniCPM-V-2_6 ]]; then
+    MODEL_PREFIX="M26"
+else
+    MODEL_PREFIX="UNKNOWN"
+fi
+
+DEVELOPMENT_MODE=${DEVELOPMENT_MODE:-false}
+
+echo "Starting base model evaluation at $(date)"
+echo "Working directory: $PWD"
+echo "CUDA devices: $CUDA_VISIBLE_DEVICES"
+echo "Policy model: ${POLICY_MODEL_PATH} (${MODEL_PREFIX})"
+echo "Dataset to process: ${DATASET}"
+echo "Development mode: ${DEVELOPMENT_MODE}"
+
+# No need to navigate - we're already in the right directory
+
+# Create run datetime for output naming
+RUN_DATETIME=$(date +"%Y%m%d_%H%M%S")
+echo "Run datetime: $RUN_DATETIME"
+
+# Create output directory
+OUTPUT_DIR="./outputs/${MODEL_PREFIX}/${DATASET}"
+mkdir -p "$OUTPUT_DIR"
+
+echo ""
+echo "==========================================="
+echo "Starting inference and evaluation"
+echo "==========================================="
+
+if [ "$POLICY_MODEL_PATH" == "OpenGVLab/InternVL2_5-8B" ]; then
+    RUN_FILE="run_inference_and_judge_internvl.py"
+else
+    RUN_FILE="run_inference_and_judge.py"
+fi
+
+
+# Build the command to run the inference script
+CMD="python $RUN_FILE \
+    --policy_model_path \"$POLICY_MODEL_PATH\" \
+    --data \"$DATASET\" \
+    --output_dir \"$OUTPUT_DIR\" \
+    --policy_gpu 0"
+
+# Add development mode flag if enabled
+if [ "$DEVELOPMENT_MODE" = "true" ]; then
+    CMD="$CMD --development_mode"
+    echo "Running in development mode (reduced dataset size)"
+fi
+
+echo "Executing command:"
+echo "$CMD"
+echo ""
+
+# Execute the inference and judge script
+eval $CMD
+
+EXIT_CODE=$?
+
+if [ $EXIT_CODE -ne 0 ]; then
+    echo ""
+    echo "ERROR: Inference script failed with exit code $EXIT_CODE"
+    
+    # Check for OOM error
+    if [ $EXIT_CODE -eq 137 ] || grep -qi "out of memory\|oom\|cuda out of memory" "$EVAL_RUN_LOG_FILE" 2>/dev/null; then
+        echo "⚠️  OOM ERROR DETECTED!"
+        echo "Consider reducing batch size or using a node with more memory"
+    fi
+    
+    exit $EXIT_CODE
+fi
+
+echo ""
+echo "==========================================="
+echo "Base model evaluation completed successfully at $(date)"
+echo "==========================================="
+echo "Results directory: $OUTPUT_DIR"
+echo "Log file: $EVAL_RUN_LOG_FILE"
+echo ""
+
+exit 0

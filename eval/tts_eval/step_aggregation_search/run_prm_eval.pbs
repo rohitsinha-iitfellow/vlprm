@@ -1,0 +1,165 @@
+#!/bin/bash
+#PBS -q AISG_large
+#PBS -j oe
+#PBS -k oed
+#PBS -l select=1:ngpus=1:ncpus=12:mem=225gb
+#PBS -l walltime=120:00:00
+
+# When running locally (not via qsub), set PBS_O_WORKDIR to current directory
+if [ -z "$PBS_O_WORKDIR" ]; then
+    PBS_O_WORKDIR=$(dirname "$(readlink -f "$0")")
+    cd "$PBS_O_WORKDIR"
+else
+    cd $PBS_O_WORKDIR
+fi
+
+# Activate the virtual environment
+source ../../qwen-evaluation/.venv/bin/activate
+echo "Python path after activation: $(which python)"
+echo "Python version: $(python --version)"
+
+# Environment setup
+export CUDA_VISIBLE_DEVICES=0
+export HF_HOME=/scratch_aisg/SPEC-SF-AISG/cache/huggingface
+export PYTHONUNBUFFERED=1
+
+# Quick CUDA driver initialization check
+echo "Running CUDA driver initialization check..."
+nvidia-smi --query-gpu=name --format=csv,noheader > /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    echo "ERROR: nvidia-smi failed - NVIDIA driver not responding"
+    echo "Job will exit with error code 99 to signal requeue needed."
+    exit 99
+fi
+
+# Test CUDA availability
+python -c "
+import sys
+import torch
+
+try:
+    if torch.cuda.is_available():
+        capability = torch.cuda.get_device_capability(0)
+        print(f'GPU 0: CUDA initialized successfully (capability: {capability})')
+    else:
+        print('ERROR: CUDA not available')
+        sys.exit(1)
+except RuntimeError as e:
+    if 'CUDA driver initialization failed' in str(e):
+        print('ERROR: CUDA driver initialization failed!')
+        sys.exit(2)
+    else:
+        print(f'ERROR: {e}')
+        sys.exit(3)
+except Exception as e:
+    print(f'ERROR: Unexpected error: {e}')
+    sys.exit(4)
+"
+
+if [ $? -ne 0 ]; then
+    echo "ERROR: CUDA driver initialization check failed!"
+    echo "Job will exit with error code 99 to signal requeue needed."
+    exit 99
+fi
+
+echo "✓ CUDA driver initialization check passed"
+
+# Get parameters from environment variables (passed via qsub -v)
+if [ -z "$MODEL_PATH" ]; then
+    echo "Error: MODEL_PATH not set. This script should be submitted via launch_prm_eval.sh"
+    exit 1
+fi
+
+if [ -z "$BASE_DATA_DIR" ]; then
+    echo "Error: BASE_DATA_DIR not set. This script should be submitted via launch_prm_eval.sh"
+    exit 1
+fi
+
+if [ -z "$JSON_FILE_PATH" ]; then
+    echo "Error: JSON_FILE_PATH not set. This script should be submitted via launch_prm_eval.sh"
+    exit 1
+fi
+
+if [ -z "$RUN_SETTING" ]; then
+    echo "Error: RUN_SETTING not set. This script should be submitted via launch_prm_eval.sh"
+    exit 1
+fi
+
+if [ -z "$POLICY_MODEL" ]; then
+    echo "Error: POLICY_MODEL not set. This script should be submitted via launch_prm_eval.sh"
+    exit 1
+fi
+
+if [ -z "$REWARD_MODEL" ]; then
+    echo "Error: REWARD_MODEL not set. This script should be submitted via launch_prm_eval.sh"
+    exit 1
+fi
+
+if [ -z "$JSON_BASENAME" ]; then
+    echo "Error: JSON_BASENAME not set. This script should be submitted via launch_prm_eval.sh"
+    exit 1
+fi
+
+if [ -z "$DATETIME" ]; then
+    echo "Error: DATETIME not set. This script should be submitted via launch_prm_eval.sh"
+    exit 1
+fi
+
+# Log file coordination - EVAL_RUN_LOG_FILE is set by launcher script
+if [ -n "$EVAL_RUN_LOG_FILE" ]; then
+    echo "Using coordinated log file: $EVAL_RUN_LOG_FILE"
+fi
+
+# Determine model prefix
+if [[ $MODEL_PATH =~ [V]isualPRM-8B ]]; then
+    model_prefix="V8B"
+elif [[ $MODEL_PATH =~ [V]isualPRM-8B-v1_1 ]]; then
+    model_prefix="V8B-v1_1"
+else
+    model_prefix="UNKNOWN"  # fallback
+fi
+
+# Use datetime inherited from launcher
+datetime="$DATETIME"
+
+# Define hierarchical output paths
+OUTPUT_DATA_DIR="outputs"
+HIERARCHICAL_OUTPUT_DIR="${OUTPUT_DATA_DIR}/${POLICY_MODEL}/${REWARD_MODEL}/${JSON_BASENAME}/${RUN_SETTING}/prm_${model_prefix}"
+
+echo "Starting PRM evaluation at $(date)"
+echo "Working directory: $PWD"
+echo "Model: $MODEL_PATH"
+echo "Model prefix: $model_prefix"
+echo "Policy model: $POLICY_MODEL"
+echo "Reward model: $REWARD_MODEL"
+echo "JSON file: $JSON_BASENAME"
+echo "Data path: ${BASE_DATA_DIR}/${JSON_FILE_PATH}"
+echo "Run setting: $RUN_SETTING"
+echo "Hierarchical output: $HIERARCHICAL_OUTPUT_DIR"
+
+# Create necessary directories with hierarchical structure
+mkdir -p "$HIERARCHICAL_OUTPUT_DIR"
+mkdir -p "logs/inference_logs/${POLICY_MODEL}/${REWARD_MODEL}/${JSON_BASENAME}/${RUN_SETTING}/prm_${model_prefix}"
+
+echo "Running PRM evaluation with setting: ${RUN_SETTING}"
+echo "Log: logs/inference_logs/${POLICY_MODEL}/${REWARD_MODEL}/${JSON_BASENAME}/${RUN_SETTING}/prm_${model_prefix}/run-${datetime}"
+
+# Main execution with full JSON file path
+CUDA_VISIBLE_DEVICES=0 python prm_tts_eval.py \
+    --model-path $MODEL_PATH \
+    --data-path ${BASE_DATA_DIR}/${JSON_FILE_PATH} \
+    --output-path "$HIERARCHICAL_OUTPUT_DIR" \
+    --tts-type ${RUN_SETTING} \
+    --run-datetime ${datetime} \
+    2>&1 | tee "logs/inference_logs/${POLICY_MODEL}/${REWARD_MODEL}/${JSON_BASENAME}/${RUN_SETTING}/prm_${model_prefix}/run-${datetime}"
+
+EXIT_CODE=$?
+
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "PRM evaluation completed successfully at $(date)"
+else
+    echo "ERROR: PRM evaluation failed with exit code $EXIT_CODE"
+    exit $EXIT_CODE
+fi
+
+exit 0

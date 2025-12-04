@@ -1,0 +1,385 @@
+# not yet tested and verified
+
+# #!/bin/bash
+# #PBS -q AISG_large
+# #PBS -j oe
+# #PBS -k oed
+# #PBS -l select=1:ngpus=8:ncpus=96:mem=1800gb
+# #PBS -l walltime=120:00:00
+
+# # Modified PBS script for node-specific data range processing
+# # Accepts NODE_DATA_BEGIN and NODE_DATA_END from the launcher
+
+# # When running locally (not via qsub), set PBS_O_WORKDIR to current directory
+# if [ -z "$PBS_O_WORKDIR" ]; then
+#     PBS_O_WORKDIR=$(dirname "$(readlink -f "$0")")
+#     cd "$PBS_O_WORKDIR"
+# else
+#     cd $PBS_O_WORKDIR
+# fi
+
+# # Activate the virtual environment
+# source /scratch_aisg/SPEC-SF-AISG/ob1/mmr-eval/qwen-evaluation/.venv/bin/activate
+# echo "Python path after activation: $(which python)"
+# echo "Python version: $(python --version)"
+
+# # Environment setup
+# export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+# export HF_HOME=/scratch_aisg/SPEC-SF-AISG/cache/huggingface
+# export PYTHONUNBUFFERED=1
+
+# # Quick CUDA driver initialization check
+# echo "Running CUDA driver initialization check..."
+
+# # Quick nvidia-smi test (< 1 second)
+# nvidia-smi --query-gpu=name --format=csv,noheader > /dev/null 2>&1
+# if [ $? -ne 0 ]; then
+#     echo "ERROR: nvidia-smi failed - NVIDIA driver not responding"
+#     echo "Job will exit with error code 99 to signal requeue needed."
+#     exit 99
+# fi
+
+# # Test CUDA availability on all 8 GPUs
+# python -c "
+# import sys
+# import torch
+
+# for gpu_id in range(8):
+#     try:
+#         if torch.cuda.is_available():
+#             capability = torch.cuda.get_device_capability(gpu_id)
+#             print(f'GPU {gpu_id}: CUDA initialized successfully (capability: {capability})')
+#         else:
+#             print(f'ERROR: CUDA not available for GPU {gpu_id}')
+#             sys.exit(1)
+#     except RuntimeError as e:
+#         if 'CUDA driver initialization failed' in str(e):
+#             print(f'ERROR: CUDA driver initialization failed for GPU {gpu_id}!')
+#             sys.exit(2)
+#         else:
+#             print(f'ERROR on GPU {gpu_id}: {e}')
+#             sys.exit(3)
+#     except Exception as e:
+#         print(f'ERROR: Unexpected error on GPU {gpu_id}: {e}')
+#         sys.exit(4)
+# "
+
+# if [ $? -ne 0 ]; then
+#     echo "ERROR: CUDA driver initialization check failed!"
+#     echo "The node GPU drivers are not properly initialized."
+#     echo "Job will exit with error code 99 to signal requeue needed."
+#     exit 99
+# fi
+
+# echo "✓ CUDA driver initialization check passed for all 8 GPUs"
+
+# # Add the parent directory to PYTHONPATH so imports work correctly
+# export PYTHONPATH="${PYTHONPATH}:/scratch_aisg/SPEC-SF-AISG/ob1/mmr-eval"
+
+# # Get checkpoint from environment variable (passed via qsub -v)
+# if [ -z "$CHECKPOINT_PATH" ]; then
+#     echo "Error: CHECKPOINT_PATH not set. This script should be submitted via launch_bon_evaluation_12node.sh"
+#     exit 1
+# fi
+
+# # Get dataset from environment variable (passed via qsub -v)
+# if [ -z "$DATASET" ]; then
+#     echo "Error: DATASET not set. This script should be submitted via launch_bon_evaluation_12node.sh"
+#     exit 1
+# fi
+
+# # Get node data range from environment variables (passed via qsub -v)
+# if [ -z "$NODE_DATA_BEGIN" ] || [ -z "$NODE_DATA_END" ]; then
+#     echo "Error: NODE_DATA_BEGIN or NODE_DATA_END not set. This script should be submitted via launch_bon_evaluation_12node.sh"
+#     exit 1
+# fi
+
+# # Get node ID and total nodes for logging
+# NODE_ID=${NODE_ID:-0}
+# TOTAL_NODES=${TOTAL_NODES:-1}
+
+# # Log file coordination - EVAL_RUN_LOG_FILE is set by launcher script
+# if [ -n "$EVAL_RUN_LOG_FILE" ]; then
+#     echo "Using coordinated log file: $EVAL_RUN_LOG_FILE"
+# fi
+
+# # Get policy model path from environment variable (passed via qsub -v)
+# if [ -z "$POLICY_MODEL_PATH" ]; then
+#     echo "Error: POLICY_MODEL_PATH not set. This script should be submitted via launch_bon_evaluation_12node.sh"
+#     exit 1
+# fi
+
+# # Get policy model name from environment variable (passed via qsub -v)
+# if [ -z "$POLICY_MODEL_NAME" ]; then
+#     echo "Error: POLICY_MODEL_NAME not set. This script should be submitted via launch_bon_evaluation_12node.sh"
+#     exit 1
+# fi
+
+# # Extract checkpoint name for output directory
+# CHECKPOINT_NAME=$(basename "$CHECKPOINT_PATH")
+# DEVELOPMENT_MODE=${DEVELOPMENT_MODE:-false}
+
+# echo "=========================================="
+# echo "Starting PARALLEL BoN evaluation for Node ${NODE_ID}/${TOTAL_NODES}"
+# echo "=========================================="
+# echo "Starting at $(date)"
+# echo "Working directory: $PWD"
+# echo "All CUDA devices: $CUDA_VISIBLE_DEVICES"
+# echo "Policy model: ${POLICY_MODEL_PATH}"
+# echo "Reward model: $CHECKPOINT_PATH"
+# echo "Dataset: ${DATASET}"
+# echo "Node data range: [${NODE_DATA_BEGIN}, ${NODE_DATA_END})"
+# echo "Development mode: ${DEVELOPMENT_MODE}"
+# echo "Checkpoint name: $CHECKPOINT_NAME"
+
+# # Navigate to reward_guided_search directory
+# cd reward_guided_search/
+
+# # Create run datetime for consistent naming across partitions
+# RUN_DATETIME=$(date +"%Y%m%d_%H%M%S")
+# echo "Run datetime: $RUN_DATETIME"
+
+# # Start GPU memory monitor in background (optional but helpful)
+# MEMORY_LOG="logs/gpu-memory-${DATASET}-node${NODE_ID}-${RUN_DATETIME}.log"
+# echo "Starting GPU memory monitor, logging to: $MEMORY_LOG"
+# python ../monitor_gpu_memory.py --interval 20 --threshold 90 --log-file "$MEMORY_LOG" &
+# MONITOR_PID=$!
+# echo "Memory monitor PID: $MONITOR_PID"
+
+# # Calculate partition sizes based on node's data range
+# TOTAL_SAMPLES=$((NODE_DATA_END - NODE_DATA_BEGIN))
+# echo "Node ${NODE_ID} processing ${TOTAL_SAMPLES} samples"
+
+# # Override for development mode
+# if [ "$DEVELOPMENT_MODE" = "true" ]; then
+#     # In development mode, just use a small subset
+#     TOTAL_SAMPLES=8
+#     NODE_DATA_BEGIN=0
+#     NODE_DATA_END=8
+#     echo "Development mode: Using only $TOTAL_SAMPLES samples for this node"
+# fi
+
+# # Calculate partition sizes within this node
+# NUM_PARTITIONS=4
+# CHUNK_SIZE=$((TOTAL_SAMPLES / NUM_PARTITIONS))
+# REMAINDER=$((TOTAL_SAMPLES % NUM_PARTITIONS))
+
+# echo "============================================"
+# echo "Node ${NODE_ID} Parallel Execution Configuration"
+# echo "============================================"
+# echo "Node samples: $TOTAL_SAMPLES"
+# echo "Number of partitions: $NUM_PARTITIONS"
+# echo "Base samples per partition: $CHUNK_SIZE"
+# if [ $REMAINDER -gt 0 ]; then
+#     LAST_PARTITION_SIZE=$((CHUNK_SIZE + REMAINDER))
+#     echo "Last partition will process: $LAST_PARTITION_SIZE samples (includes $REMAINDER remainder)"
+# fi
+# echo "============================================"
+
+# # Array to store PIDs for monitoring
+# declare -a pids
+
+# # Launch 4 parallel processes within this node's data range
+# for i in 0 1 2 3; do
+#     # Calculate partition range relative to node's data
+#     LOCAL_START=$((i * CHUNK_SIZE))
+#     if [ $i -eq 3 ]; then
+#         # Last partition gets all remaining samples
+#         LOCAL_END=$TOTAL_SAMPLES
+#     else
+#         LOCAL_END=$(((i + 1) * CHUNK_SIZE))
+#     fi
+
+#     # Convert to absolute indices in the full dataset
+#     ABSOLUTE_START=$((NODE_DATA_BEGIN + LOCAL_START))
+#     ABSOLUTE_END=$((NODE_DATA_BEGIN + LOCAL_END))
+
+#     # Physical GPU assignments
+#     POLICY_GPU=$((i * 2))      # Will be 0, 2, 4, 6
+#     REWARD_GPU=$((i * 2 + 1))  # Will be 1, 3, 5, 7
+
+#     # Create partition-specific log file
+#     PARTITION_LOG="logs/node${NODE_ID}-partition-${i}-${DATASET}-${RUN_DATETIME}.log"
+
+#     echo "Launching Node ${NODE_ID} Partition $i:"
+#     echo "  Local data range: [$LOCAL_START, $LOCAL_END) of node's ${TOTAL_SAMPLES} samples"
+#     echo "  Absolute data range: [$ABSOLUTE_START, $ABSOLUTE_END)"
+#     echo "  GPUs: Policy=$POLICY_GPU, Reward=$REWARD_GPU"
+#     echo "  Log: $PARTITION_LOG"
+
+#     # Build command with isolated GPU visibility
+#     # Each process only sees its 2 assigned GPUs as cuda:0 and cuda:1
+#     CMD="CUDA_VISIBLE_DEVICES=$POLICY_GPU,$REWARD_GPU python vllm_bon_greedy_search_no_template.py \
+#         --policy_model_path \"$POLICY_MODEL_PATH\" \
+#         --reward_model_path \"$CHECKPOINT_PATH\" \
+#         --data \"$DATASET\" \
+#         --output_dir \"./outputs/${POLICY_MODEL_NAME}/${CHECKPOINT_NAME}/${DATASET}-results/node${NODE_ID}-run-${RUN_DATETIME}\" \
+#         --data_begin $ABSOLUTE_START \
+#         --data_end $ABSOLUTE_END \
+#         --policy_gpu 0 \
+#         --reward_gpu 1 \
+#         --partition_id $i \
+#         --run_datetime \"${RUN_DATETIME}\""
+
+#     if [ "$DEVELOPMENT_MODE" = "true" ]; then
+#         CMD="$CMD --development_mode"
+#     fi
+
+#     # Launch process in background with its own GPU visibility
+#     eval $CMD > "$PARTITION_LOG" 2>&1 &
+#     pids[$i]=$!
+
+#     echo "  PID: ${pids[$i]}"
+#     echo ""
+
+#     # Small delay to avoid race conditions during initialization
+#     sleep 2
+# done
+
+# echo "All partitions launched for Node ${NODE_ID}. Waiting for completion..."
+# echo ""
+
+# # Monitor progress
+# WAIT_INTERVAL=30
+# ELAPSED=0
+# OOM_DETECTED=false
+
+# while true; do
+#     ALL_DONE=true
+#     echo "Node ${NODE_ID} status check at $(date) (elapsed: ${ELAPSED}s):"
+
+#     for i in 0 1 2 3; do
+#         if kill -0 ${pids[$i]} 2>/dev/null; then
+#             echo "  Partition $i (PID ${pids[$i]}): RUNNING"
+#             ALL_DONE=false
+#         else
+#             # Check exit code
+#             wait ${pids[$i]}
+#             EXIT_CODE=$?
+#             if [ $EXIT_CODE -eq 0 ]; then
+#                 echo "  Partition $i (PID ${pids[$i]}): COMPLETED"
+#             else
+#                 echo "  Partition $i (PID ${pids[$i]}): FAILED (exit code: $EXIT_CODE)"
+
+#                 # Check partition log for OOM indicators
+#                 PARTITION_LOG="logs/node${NODE_ID}-partition-${i}-${DATASET}-${RUN_DATETIME}.log"
+#                 if grep -qi "out of memory\|oom\|cuda out of memory" "$PARTITION_LOG" 2>/dev/null; then
+#                     echo "  ⚠️  OOM ERROR DETECTED in partition $i!"
+#                     OOM_DETECTED=true
+#                 fi
+#             fi
+#         fi
+#     done
+
+#     if [ "$ALL_DONE" = true ]; then
+#         break
+#     fi
+
+#     echo ""
+#     sleep $WAIT_INTERVAL
+#     ELAPSED=$((ELAPSED + WAIT_INTERVAL))
+# done
+
+# # Stop memory monitor
+# if [ -n "$MONITOR_PID" ]; then
+#     kill $MONITOR_PID 2>/dev/null
+#     echo "Stopped memory monitor"
+# fi
+
+# echo ""
+# echo "All partitions have finished for Node ${NODE_ID}. Checking results..."
+
+# # Check if all partitions succeeded
+# SUCCESS=true
+# FAILED_PARTITIONS=""
+# for i in 0 1 2 3; do
+#     wait ${pids[$i]}
+#     EXIT_CODE=$?
+#     if [ $EXIT_CODE -ne 0 ]; then
+#         echo "ERROR: Partition $i failed with exit code $EXIT_CODE"
+#         echo "Check log: reward_guided_search/logs/node${NODE_ID}-partition-${i}-${DATASET}-${RUN_DATETIME}.log"
+#         SUCCESS=false
+#         FAILED_PARTITIONS="$FAILED_PARTITIONS $i"
+#     fi
+# done
+
+# if [ "$OOM_DETECTED" = true ]; then
+#     echo ""
+#     echo "==========================================="
+#     echo "⚠️  OOM ERROR DETECTED!"
+#     echo "==========================================="
+#     echo "One or more partitions failed due to out-of-memory errors."
+#     echo "Consider:"
+#     echo "  1. Reducing batch size (n=16 → n=8) in bon_greedy_search_no_template.py"
+#     echo "  2. Using fewer parallel partitions (4 → 2)"
+#     echo "  3. Using a node with more memory"
+#     echo "Failed partitions:$FAILED_PARTITIONS"
+#     echo "Memory log: $MEMORY_LOG"
+#     echo "==========================================="
+# fi
+
+# if [ "$SUCCESS" = false ]; then
+#     echo "ERROR: One or more partitions failed. Exiting without merging."
+#     if [ "$OOM_DETECTED" = true ]; then
+#         # Exit with special code for OOM
+#         exit 137
+#     else
+#         exit 1
+#     fi
+# fi
+
+# echo ""
+# echo "============================================"
+# echo "Merging partition results for Node ${NODE_ID}..."
+# echo "============================================"
+
+# # Merge results for this node
+# OUTPUT_DIR="./outputs/${POLICY_MODEL_NAME}/${CHECKPOINT_NAME}/${DATASET}-results/node${NODE_ID}-run-${RUN_DATETIME}"
+
+# # Set Weave project name (can be overridden via environment variable)
+# WEAVE_PROJECT=${WEAVE_PROJECT:-"aisg-arf/mmr-eval"}
+# DISABLE_WEAVE=${DISABLE_WEAVE:-"true"}
+
+# echo "Weave project: $WEAVE_PROJECT"
+# echo "Disable Weave: $DISABLE_WEAVE"
+
+# # Calculate the actual total for this node's merge
+# NODE_TOTAL_SAMPLES=$((NODE_DATA_END - NODE_DATA_BEGIN))
+
+# MERGE_CMD="python ../merge_partition_results.py \
+#     --output_dir \"$OUTPUT_DIR\" \
+#     --run_datetime \"$RUN_DATETIME\" \
+#     --dataset \"$DATASET\" \
+#     --num_partitions $NUM_PARTITIONS \
+#     --policy_model_path \"$POLICY_MODEL_PATH\" \
+#     --reward_model_path \"$CHECKPOINT_PATH\" \
+#     --weave_project \"$WEAVE_PROJECT\""
+
+# if [ "$DISABLE_WEAVE" = "true" ]; then
+#     MERGE_CMD="$MERGE_CMD --disable_weave"
+# fi
+
+# eval $MERGE_CMD
+
+# MERGE_EXIT_CODE=$?
+
+# # Go back to evaluation directory
+# cd ..
+
+# if [ $MERGE_EXIT_CODE -ne 0 ]; then
+#     echo "ERROR: Merge script failed with exit code $MERGE_EXIT_CODE"
+#     exit $MERGE_EXIT_CODE
+# fi
+
+# echo ""
+# echo "============================================"
+# echo "Node ${NODE_ID} evaluation completed successfully at $(date)"
+# echo "============================================"
+# echo "Node data range: [${NODE_DATA_BEGIN}, ${NODE_DATA_END})"
+# echo "Results directory: $OUTPUT_DIR"
+# echo "Merged results file: result-merged-0-${NODE_TOTAL_SAMPLES}-${RUN_DATETIME}.json"
+# echo ""
+# echo "Note: Final merge across all ${TOTAL_NODES} nodes will be needed after all nodes complete"
+# echo ""
+
+# exit 0

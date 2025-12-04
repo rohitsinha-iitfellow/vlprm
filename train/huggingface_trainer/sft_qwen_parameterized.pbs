@@ -1,0 +1,92 @@
+#!/bin/bash
+#PBS -q AISG_large
+#PBS -j oe
+#PBS -k oed
+
+#PBS -l select=1:ngpus=8:ncpus=96:mem=1800gb
+#PBS -l walltime=336:00:00
+
+echo "PBS_OUTPUT_FILE: ${PBS_O_WORKDIR}/${PBS_OUTPUT_FILE}"
+# Ensure immediate log flushing
+exec > >(stdbuf -oL tee -a "${PBS_O_WORKDIR}/${PBS_OUTPUT_FILE}")
+exec 2>&1
+
+cd $PBS_O_WORKDIR
+
+if [ ! -d ".venv" ]; then
+    echo "ERROR: Virtual environment .venv not found in $PWD"
+    exit 1
+fi
+
+source .venv/bin/activate
+
+if [ -f ".env.pbs" ]; then
+    source .env.pbs
+else
+    echo "WARNING: .env.pbs file not found, continuing without it"
+fi
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export NCCL_DEBUG=INFO
+export HF_HOME=/scratch_aisg/SPEC-SF-AISG/cache/huggingface
+
+# Force immediate log flushing (usage depending on cluster)
+export PYTHONUNBUFFERED=1
+
+uid="$(date +%Y%m%d_%H%M%S)"
+base_model="Qwen/Qwen2.5-VL-7B-Instruct"
+dataset_name=${DATASET_NAME:-"ob11/VL-PRM300K-V1-train"}
+epochs=2
+
+micro_batch_size=${MICRO_BATCH_SIZE:-1}
+gradient_accumulation_steps=${GRADIENT_ACCUMULATION_STEPS:-1}
+lr=${LEARNING_RATE:-1e-5}
+max_grad_norm=${MAX_GRAD_NORM:-1.0}
+tune_vision=${TUNE_VISION:-true}
+max_steps=-1 # -> not used now
+min_lr=0 # -> not used now
+weight_decay=1e-4
+gpu_count=$(nvidia-smi -L | wc -l) # -> not used now
+push_to_hub=false # -> not used now
+
+echo "Starting training at $(date)"
+echo "Working directory: $PWD"
+echo "Python path: $(which python)"
+echo "CUDA devices: $CUDA_VISIBLE_DEVICES"
+echo "PBS Job Name: ${PBS_JOBNAME:-'Not set'}"
+echo "Run name for training: ${PBS_JOBNAME:-"sft-qwen-$(date +%Y%m%d_%H%M%S)"}"
+echo "Dataset: ${dataset_name}"
+echo "Micro batch size: ${micro_batch_size}"
+echo "Gradient accumulation steps: ${gradient_accumulation_steps}"
+echo "Learning rate: ${lr}"
+echo "Max grad norm: ${max_grad_norm}"
+echo "Tune vision encoder: ${tune_vision}"
+
+accelerate launch train/sft_qwen.py \
+    --seed 100 \
+    --dataset_name ${dataset_name} \
+    --model_name_or_path ${base_model} \
+    --per_device_train_batch_size ${micro_batch_size} \
+    --gradient_accumulation_steps ${gradient_accumulation_steps} \
+    --output_dir training_outputs/${PBS_JOBNAME} \
+    --bf16 True \
+    --torch_dtype bfloat16 \
+    --gradient_checkpointing True \
+    --num_train_epochs ${epochs} \
+    --learning_rate ${lr} \
+    --lr_scheduler_type cosine \
+    --weight_decay ${weight_decay} \
+    --warmup_ratio 0.05 \
+    --adam_beta1 0.9 \
+    --adam_beta2 0.95 \
+    --max_grad_norm ${max_grad_norm} \
+    --run_name ${PBS_JOBNAME:-"sft-qwen-$(date +%Y%m%d_%H%M%S)"} \
+    --tune_vision ${tune_vision} \
+    --eval_strategy "no" \
+    --save_strategy "epoch" \
+    --save_total_limit 1 \
+
+exit_code=$?
+echo "Training completed with exit code: $exit_code at $(date)"
+
+exit $exit_code 

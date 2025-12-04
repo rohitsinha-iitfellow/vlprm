@@ -1,0 +1,9 @@
+exclude-list.txt
+__pycache__/
+eval/base_model_eval/vLLM_evaluation_code/judge_mathvista/*
+.env
+eval/base_model_eval/vLLM_evaluation_code/outputs/*
+eval/base_model_eval/vLLM_evaluation_code/logs/*
+eval/tts_eval/reward_guided_search/utils/logs/*
+eval/tts_eval/reward_guided_search/logs/*
+eval/tts_eval/reward_guided_search/outputs/*
