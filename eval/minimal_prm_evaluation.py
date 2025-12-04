@@ -1,20 +1,23 @@
 """Minimal, self-contained VL-PRM evaluation example.
 
 This script scores step-by-step reasoning traces with a Vision-Language
-Process Reward Model (VL-PRM) on a custom JSON dataset.
+Process Reward Model (VL-PRM) on a custom JSON dataset. It can either
+consume pre-written steps or draft candidate steps from a Qwen2.5-VL
+policy model and let the VL-PRM choose the best one at each hop.
 
 Dataset format (list of examples):
 [
   {
     "image": "path/to/question.jpg",            # Required
     "question": "What is shown in the image?",  # Required
-    "steps": ["Step 1", "Step 2"]               # Required list of strings
+    "steps": ["Step 1", "Step 2"]               # Optional list of strings
   }
 ]
 
 Usage:
     python -m eval.minimal_prm_evaluation \
         --model-path ob11/Qwen-VL-PRM-3B \
+        --policy-model-path Qwen/Qwen2.5-VL-7B-Instruct \
         --data-path /path/to/my_dataset.json \
         --output-path /tmp/prm_scores.json
 
@@ -35,7 +38,7 @@ import torch
 import torchvision.transforms as T
 from PIL import Image
 from torchvision.transforms.functional import InterpolationMode
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -59,6 +62,8 @@ Assess the cumulative correctness of the entire solution up to each step.
 Only respond with "+" or "-". No explanations.
 
 An error in any step invalidates all subsequent steps."""
+
+POLICY_SYSTEM_PROMPT = """You are a helpful visual reasoning assistant. Carefully read the question, look at the image, and produce the next concise reasoning step without repeating previous steps. Stop once you have enough information to deliver a final answer."""
 
 
 def build_transform(input_size: int) -> T.Compose:
@@ -164,6 +169,76 @@ def save_json(data, path: str | Path) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+class QwenPolicyModel:
+    """Minimal Qwen2.5-VL policy that proposes next steps."""
+
+    def __init__(
+        self,
+        model_path: str = "Qwen/Qwen2.5-VL-7B-Instruct",
+        device: str | None = None,
+        dtype: str = "bfloat16",
+        max_new_tokens: int = 128,
+    ) -> None:
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        torch_dtype = getattr(torch, dtype) if dtype != "auto" else torch.bfloat16
+
+        self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True, use_fast=False)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path, trust_remote_code=True, torch_dtype=torch_dtype, low_cpu_mem_usage=True
+        ).eval().to(self.device)
+        self.max_new_tokens = max_new_tokens
+
+    def _build_messages(self, image: Image.Image, question: str, steps: Sequence[str]) -> list[dict]:
+        step_history = "\n".join(f"Step {i + 1}: {s}" for i, s in enumerate(steps))
+        user_instruction = [
+            {"type": "image", "image": image},
+            {
+                "type": "text",
+                "text": (
+                    f"Question: {question}\n\n"
+                    "You are continuing the reasoning one step at a time."
+                    + (f"\nExisting steps:\n{step_history}" if step_history else "")
+                    + "\nProvide ONLY the next short reasoning step."
+                ),
+            },
+        ]
+
+        return [
+            {"role": "system", "content": [{"type": "text", "text": POLICY_SYSTEM_PROMPT}]},
+            {"role": "user", "content": user_instruction},
+        ]
+
+    def generate_candidates(
+        self,
+        image: Image.Image,
+        question: str,
+        steps: Sequence[str],
+        num_candidates: int,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+    ) -> list[str]:
+        messages = self._build_messages(image, question, steps)
+        text_prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.processor(
+            text=[text_prompt], images=[image], return_tensors="pt", padding=True, truncation=True
+        ).to(self.device)
+
+        outputs = self.model.generate(
+            **inputs,
+            do_sample=temperature > 0,
+            temperature=temperature,
+            top_p=top_p,
+            num_return_sequences=num_candidates,
+            max_new_tokens=self.max_new_tokens,
+            pad_token_id=self.processor.tokenizer.eos_token_id,
+        )
+
+        prompt_length = inputs["input_ids"].shape[1]
+        candidate_token_ids = outputs[:, prompt_length:]
+        candidates = self.processor.batch_decode(candidate_token_ids, skip_special_tokens=True)
+        return [c.strip() for c in candidates if c.strip()]
+
+
 class MinimalVisualPRM:
     """Lightweight PRM wrapper used purely for inference."""
 
@@ -266,11 +341,35 @@ class MinimalVisualPRM:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run VL-PRM scoring on a custom JSON dataset.")
     parser.add_argument("--model-path", required=True, help="Hugging Face model id or local path for the VL-PRM checkpoint.")
+    parser.add_argument(
+        "--policy-model-path",
+        default="Qwen/Qwen2.5-VL-7B-Instruct",
+        help="Qwen policy model used to draft candidate steps.",
+    )
     parser.add_argument("--data-path", required=True, help="Path to the custom dataset JSON (see header for format).")
     parser.add_argument("--output-path", required=True, help="Where to write the scored JSON file.")
     parser.add_argument("--dtype", default="bfloat16", help="Torch dtype to load weights with (e.g., float16, bfloat16).")
     parser.add_argument("--device", default=None, help="Optional device override (e.g., cuda:0, cpu).")
     parser.add_argument("--max-samples", type=int, default=None, help="Optional cap on processed samples for smoke tests.")
+    parser.add_argument("--max-steps", type=int, default=4, help="Maximum reasoning steps to roll out with the policy.")
+    parser.add_argument(
+        "--num-candidates", type=int, default=4, help="Number of candidate steps sampled from the policy per step."
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature for the Qwen policy (0 switches to greedy).",
+    )
+    parser.add_argument("--top-p", type=float, default=0.9, help="Top-p nucleus sampling value for the policy.")
+    parser.add_argument(
+        "--stop-phrase",
+        default="final answer",
+        help="If this phrase appears in the selected step, roll out stops early.",
+    )
+    parser.add_argument(
+        "--max-new-tokens", type=int, default=128, help="Maximum tokens generated for each policy candidate step."
+    )
     return parser.parse_args()
 
 
@@ -278,21 +377,57 @@ def main() -> None:
     args = parse_args()
     dataset = load_json(args.data_path)
     if not isinstance(dataset, list):
-        raise ValueError("Dataset JSON must be a list of objects with image, question, and steps fields.")
+        raise ValueError("Dataset JSON must be a list of objects with image and question fields.")
 
     model = MinimalVisualPRM(args.model_path, device=args.device, dtype=args.dtype)
+    policy = QwenPolicyModel(
+        model_path=args.policy_model_path, device=args.device, dtype=args.dtype, max_new_tokens=args.max_new_tokens
+    )
     results: List[dict] = []
 
     for idx, example in enumerate(dataset):
         if args.max_samples is not None and idx >= args.max_samples:
             break
-        missing_fields = {k for k in ("image", "question", "steps") if k not in example}
+        missing_fields = {k for k in ("image", "question") if k not in example}
         if missing_fields:
             raise ValueError(f"Example {idx} is missing fields: {missing_fields}")
 
-        image_b64 = encode_image_to_base64(example["image"])
-        score = model.score_steps(image_b64, example["question"], example["steps"])
-        results.append({**example, "average_step_score": score})
+        image_path = Path(example["image"])
+        with Image.open(image_path) as img:
+            image = img.convert("RGB")
+
+        image_b64 = encode_image_to_base64(image_path)
+        question = example["question"]
+        # If manual steps are provided, score them directly; otherwise roll out with the policy.
+        if "steps" in example and isinstance(example["steps"], list):
+            steps = example["steps"]
+            step_scores = [model.score_steps(image_b64, question, steps[: i + 1]) for i in range(len(steps))]
+        else:
+            steps = []
+            step_scores = []
+            for _ in range(args.max_steps):
+                candidates = policy.generate_candidates(
+                    image,
+                    question,
+                    steps,
+                    num_candidates=args.num_candidates,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                )
+                if not candidates:
+                    break
+
+                scored_candidates = [
+                    (candidate, model.score_steps(image_b64, question, steps + [candidate])) for candidate in candidates
+                ]
+                best_step, best_score = max(scored_candidates, key=lambda x: x[1])
+                steps.append(best_step)
+                step_scores.append(best_score)
+                if args.stop_phrase and args.stop_phrase.lower() in best_step.lower():
+                    break
+
+        avg_score = float(sum(step_scores) / len(step_scores)) if step_scores else 0.0
+        results.append({**example, "steps": steps, "step_scores": step_scores, "average_step_score": avg_score})
 
     save_json(results, args.output_path)
 
