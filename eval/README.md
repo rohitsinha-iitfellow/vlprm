@@ -53,6 +53,33 @@ Then run ```./run_bon_greedy_search_no_template.sh``` to run the evaluation.
 
 or ```./vllm_lazy_greedy_search_no_template.sh``` if you have a PBS cluster.
 
+# Minimal evaluation on your own dataset
+
+If you just want to score step-by-step traces from your own data with a VL-PRM checkpoint, use the lightweight script below. It only requires a single GPU and does not depend on vLLM.
+
+1. Format your dataset as a JSON list of objects:
+
+```json
+[
+  {
+    "image": "/path/to/image.jpg",
+    "question": "What is shown in the image?",
+    "steps": ["First reasoning step", "Second reasoning step"]
+  }
+]
+```
+
+2. Run the minimal evaluator:
+
+```bash
+python -m eval.minimal_prm_evaluation \
+  --model-path ob11/Qwen-VL-PRM-3B \
+  --data-path /path/to/my_dataset.json \
+  --output-path /tmp/prm_scores.json
+```
+
+The output JSON mirrors the input and adds an `average_step_score` field in `[0, 1]` for each example.
+
 # Running LLM Judge Evaluation for MathVision
 - MathVision involves commonly answering questions with LaTex involved, hence we need to support SymPy answer validators for accurate output evaluation.
 
